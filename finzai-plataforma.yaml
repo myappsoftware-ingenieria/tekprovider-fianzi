@@ -1,0 +1,1034 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Finzai - Plataforma base en AWS (puntos 1 al 9 de la solicitud de infraestructura).
+  Region objetivo: mx-central-1 (Mexico Central). Crea red multi-AZ, grupos de
+  seguridad, entrada (ACM + ALB), cluster ECS Fargate con Service Connect, RDS
+  PostgreSQL 14, EFS, Secrets Manager, ECR para nginx y el acceso del operador.
+  NO incluye las 31 definiciones de tarea/servicios de ECS (punto 4.7 detalle):
+  esas las registra el solicitante con los permisos del punto 9.
+
+# ---------------------------------------------------------------------------
+# Organizacion de la consola: agrupa y ordena los parametros al desplegar.
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Identidad del ambiente
+        Parameters:
+          - EnvironmentName
+          - Subdomain
+          - HostedZoneId
+          - OperatorPrincipalArn
+      - Label:
+          default: Red
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - AppSubnet1Cidr
+          - AppSubnet2Cidr
+          - DataSubnet1Cidr
+          - DataSubnet2Cidr
+      - Label:
+          default: Acceso de entrada
+        Parameters:
+          - AllowedIngressCidr
+      - Label:
+          default: Base de datos (RDS)
+        Parameters:
+          - DbInstanceClass
+          - DbAllocatedStorage
+          - DbMaxAllocatedStorage
+          - DbMasterUsername
+    ParameterLabels:
+      EnvironmentName:
+        default: Nombre del ambiente (ej. finzai-demo)
+      Subdomain:
+        default: Subdominio publico (ej. finzai-demo.tekprovider.net)
+      OperatorPrincipalArn:
+        default: ARN del usuario/rol operador (cflores)
+
+# ---------------------------------------------------------------------------
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: finzai-demo
+    AllowedPattern: "^[a-z][a-z0-9-]{2,30}$"
+    Description: >-
+      Nombre del ambiente. Se usa como prefijo de nombres y en los ARN de los
+      secretos (finzai/<ambiente>/...). Minusculas, numeros y guiones.
+
+  Subdomain:
+    Type: String
+    Default: ""
+    Description: >-
+      Subdominio para el certificado ACM y el registro DNS (punto 3.1 y 3.4).
+      Dejar vacio si aun no esta definido: en ese caso no se crean ni el
+      certificado ni el registro, y el ALB queda solo con el listener 80.
+
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: >-
+      Id de la zona hospedada de Route 53 donde vive el Subdomain. Si se deja
+      vacio, no se crea el registro DNS (lo gestionas fuera por CNAME).
+
+  OperatorPrincipalArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN del principal (usuario IAM o rol) que operara el ambiente
+      (cflores@tekprovider.net). Si se deja vacio, no se crea la politica de
+      operador (punto 9) y la gestionas aparte.
+
+  AllowedIngressCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+    AllowedPattern: "^([0-9]{1,3}\\.){3}[0-9]{1,3}/([0-9]|[1-2][0-9]|3[0-2])$"
+    Description: >-
+      CIDR de origen que puede entrar al ALB por 80/443 (punto 2). Ejemplo:
+      203.0.113.10/32. El valor por omision (0.0.0.0/0) es abierto: restringelo
+      a la oficina/VPN antes de produccion. Para varios rangos, usa una lista de
+      prefijos administrada (ver README).
+
+  VpcCidr:
+    Type: String
+    Default: "10.20.0.0/16"
+  PublicSubnet1Cidr:
+    Type: String
+    Default: "10.20.0.0/24"
+  PublicSubnet2Cidr:
+    Type: String
+    Default: "10.20.1.0/24"
+  AppSubnet1Cidr:
+    Type: String
+    Default: "10.20.10.0/24"
+  AppSubnet2Cidr:
+    Type: String
+    Default: "10.20.11.0/24"
+  DataSubnet1Cidr:
+    Type: String
+    Default: "10.20.20.0/24"
+  DataSubnet2Cidr:
+    Type: String
+    Default: "10.20.21.0/24"
+
+  DbInstanceClass:
+    Type: String
+    Default: "db.t4g.medium"
+    Description: Clase de la instancia RDS (punto 5).
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    Description: Almacenamiento inicial gp3 en GB.
+  DbMaxAllocatedStorage:
+    Type: Number
+    Default: 50
+    Description: Tope de crecimiento automatico en GB.
+  DbMasterUsername:
+    Type: String
+    Default: "postgres"
+    AllowedPattern: "^[a-zA-Z][a-zA-Z0-9]{1,30}$"
+    Description: Usuario maestro de RDS (punto 5).
+
+# ---------------------------------------------------------------------------
+Conditions:
+  HasSubdomain: !Not [!Equals [!Ref Subdomain, ""]]
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, ""]]
+  CreateDnsRecord: !And
+    - !Condition HasSubdomain
+    - !Condition HasHostedZone
+  HasOperator: !Not [!Equals [!Ref OperatorPrincipalArn, ""]]
+
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # 1. RED
+  # =========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-vpc"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-igw"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Subredes publicas (ALB + NAT) ---
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-1"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-2"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # --- Subredes privadas de aplicacion (ECS) ---
+  AppSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref AppSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-app-1"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  AppSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref AppSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-app-2"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # --- Subredes privadas de datos (RDS + EFS) ---
+  DataSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref DataSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-data-1"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  DataSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Ref DataSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-data-2"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # --- Ruteo publico ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-public-rt"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # --- NAT Gateway UNICO (punto 1: uno, no uno por zona) ---
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-nat-eip"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-nat"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # --- Ruteo privado (app + data comparten salida via el unico NAT) ---
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-private-rt"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway
+
+  AppSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref AppSubnet1
+
+  AppSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref AppSubnet2
+
+  DataSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref DataSubnet1
+
+  DataSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref DataSubnet2
+
+  # =========================================================================
+  # 2. GRUPOS DE SEGURIDAD
+  # =========================================================================
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ALB - entrada 80/443 solo desde origenes permitidos"
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb-sg"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ECS - recibe del ALB; los servicios se llaman entre si"
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ecs-sg"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "RDS - 5432 solo desde ECS"
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-rds-sg"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  EfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "EFS - 2049 solo desde ECS"
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-efs-sg"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # --- Reglas del grupo ALB: 443 y 80 desde el CIDR permitido ---
+  # Un solo rango. Para varios, reemplaza CidrIp por SourcePrefixListId y una
+  # lista de prefijos administrada (ver README).
+  AlbIngress443:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref AllowedIngressCidr
+      Description: "HTTPS desde origen permitido"
+
+  AlbIngress80:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref AllowedIngressCidr
+      Description: "HTTP (redirige a 443) desde origen permitido"
+
+  AlbEgressToEcs:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      DestinationSecurityGroupId: !Ref EcsSecurityGroup
+      Description: "Al grupo ECS, TCP 80"
+
+  # --- Reglas del grupo ECS ---
+  EcsIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: "Del ALB, TCP 80 (nginx)"
+
+  EcsIngressSelf80:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Description: "De si mismo, TCP 80 (Service Connect)"
+
+  EcsIngressSelf8080:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Description: "De si mismo, TCP 8080 (los servicios se llaman entre ellos)"
+
+  EcsEgressAll:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: "-1"
+      CidrIp: "0.0.0.0/0"
+      Description: "Salida a internet via NAT (Docker Hub, SMTP, aseguradoras)"
+
+  # --- Reglas del grupo RDS ---
+  RdsIngressFromEcs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref RdsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Description: "Del grupo ECS, TCP 5432"
+
+  # --- Reglas del grupo EFS ---
+  EfsIngressFromEcs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EfsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+      Description: "Del grupo ECS, TCP 2049"
+
+  # =========================================================================
+  # 3. ENTRADA (ACM + ALB)
+  # =========================================================================
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasSubdomain
+    Properties:
+      DomainName: !Ref Subdomain
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-cert"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "120"
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # Grupo de destino tipo IP: lo usa unicamente el servicio nginx.
+  NginxTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-nginx-tg"
+      VpcId: !Ref Vpc
+      TargetType: ip
+      Protocol: HTTP
+      Port: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: "/salud"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # Listener 443: con certificado, reenvia a nginx. Solo si hay subdominio.
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasSubdomain
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NginxTargetGroup
+
+  # Listener 80: si hay subdominio redirige a 443; si no, reenvia directo a nginx
+  # para poder validar sin TLS mientras se define el dominio.
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        !If
+          - HasSubdomain
+          - - Type: redirect
+              RedirectConfig:
+                Protocol: HTTPS
+                Port: "443"
+                StatusCode: HTTP_301
+          - - Type: forward
+              TargetGroupArn: !Ref NginxTargetGroup
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateDnsRecord
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref Subdomain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+
+  # =========================================================================
+  # 7. SECRETOS (Secrets Manager) - la administracion los crea; el solicitante
+  #    carga los valores. Se crean con un marcador de posicion.
+  # =========================================================================
+  DbConnectionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "finzai/${EnvironmentName}/bd-cadena-conexion"
+      Description: "Cadena de conexion completa a RDS (la cargan despues)"
+      SecretString: "pendiente-de-cargar"
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  IamKeyProtectionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "finzai/${EnvironmentName}/iam-key-protection"
+      Description: "Llave de proteccion del servicio de identidad (iamapi)"
+      SecretString: "pendiente-de-cargar"
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  DockerHubSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "finzai/${EnvironmentName}/dockerhub"
+      Description: "Usuario y token de Docker Hub (solo si los repos son privados)"
+      SecretString: '{"username":"pendiente","password":"pendiente"}'
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # Contrasena maestra de RDS: la genera Secrets Manager y queda disponible
+  # para que el solicitante construya la cadena de conexion.
+  DbMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "finzai/${EnvironmentName}/rds-master"
+      Description: "Credenciales del usuario maestro de RDS"
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DbMasterUsername}"}'
+        GenerateStringKey: "password"
+        PasswordLength: 24
+        ExcludeCharacters: '"@/\ '
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # =========================================================================
+  # 5. BASE DE DATOS (RDS PostgreSQL 14)
+  # =========================================================================
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subredes de datos para RDS"
+      SubnetIds:
+        - !Ref DataSubnet1
+        - !Ref DataSubnet2
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-pg"
+      Engine: postgres
+      EngineVersion: "14.19"
+      DBInstanceClass: !Ref DbInstanceClass
+      MultiAZ: false
+      AllocatedStorage: !Ref DbAllocatedStorage
+      MaxAllocatedStorage: !Ref DbMaxAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbMasterSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbMasterSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroup
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # =========================================================================
+  # 6. ARCHIVOS (EFS)
+  # =========================================================================
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-efs"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  MountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref DataSubnet1
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  MountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref DataSubnet2
+      SecurityGroups:
+        - !Ref EfsSecurityGroup
+
+  FinzaiDocsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser:
+        Uid: 1000
+        Gid: 1000
+      RootDirectory:
+        Path: "/FinzaiDocs"
+        CreationInfo:
+          OwnerUid: 1000
+          OwnerGid: 1000
+          Permissions: "755"
+      AccessPointTags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-efs-ap"
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # =========================================================================
+  # 4. ECS (cluster, Service Connect, roles, bitacoras, ECR)
+  # =========================================================================
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${EnvironmentName}-nginx"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/finzai-${EnvironmentName}"
+      RetentionInDays: 30
+
+  # Nota: el rol vinculado al servicio ECS (AWSServiceRoleForECS) ya existe en
+  # esta cuenta, por lo que NO se crea aqui (hacerlo da error AlreadyExists).
+  # Si algun dia despliegas en una cuenta/region totalmente nueva donde
+  # CreateCluster falle con "ECS Service Linked Role is not ready", crea el rol
+  # una sola vez, fuera de la pila, con:
+  #   aws iam create-service-linked-role --aws-service-name ecs.amazonaws.com
+  # y vuelve a desplegar.
+  ServiceConnectNamespace:
+    Type: AWS::ServiceDiscovery::HttpNamespace
+    Properties:
+      Name: !Sub "finzai-${EnvironmentName}"
+      Description: "Service Connect namespace de Finzai"
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "finzai-${EnvironmentName}"
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      ServiceConnectDefaults:
+        Namespace: !GetAtt ServiceConnectNamespace.Arn
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # Rol de ejecucion de tareas: imagen desde ECR + leer secretos (punto 4.3)
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-task-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: leer-secretos-finzai
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DbConnectionSecret
+                  - !Ref IamKeyProtectionSecret
+                  - !Ref DockerHubSecret
+                  - !Ref DbMasterSecret
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # Rol de tarea: permisos de ECS Exec (ssmmessages) (punto 4.4)
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-task"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecs-exec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: "*"
+      Tags:
+        - Key: Proyecto
+          Value: Finzai
+        - Key: Ambiente
+          Value: !Ref EnvironmentName
+
+  # =========================================================================
+  # 9. ACCESO DEL OPERADOR (politica limitada al ambiente)
+  # =========================================================================
+  OperatorPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: HasOperator
+    Properties:
+      ManagedPolicyName: !Sub "${EnvironmentName}-operador"
+      Description: "Permisos del operador del ambiente Finzai (punto 9)"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EcsOperacion
+            Effect: Allow
+            Action:
+              - ecs:Describe*
+              - ecs:List*
+              - ecs:RegisterTaskDefinition
+              - ecs:DeregisterTaskDefinition
+              - ecs:CreateService
+              - ecs:UpdateService
+              - ecs:DeleteService
+              - ecs:ExecuteCommand
+            Resource: "*"
+          - Sid: PassRoleTareas
+            Effect: Allow
+            Action: iam:PassRole
+            Resource:
+              - !GetAtt TaskExecutionRole.Arn
+              - !GetAtt TaskRole.Arn
+          - Sid: EcrNginx
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:CompleteLayerUpload
+              - ecr:InitiateLayerUpload
+              - ecr:PutImage
+              - ecr:UploadLayerPart
+            Resource: "*"
+          - Sid: SecretosEscritura
+            Effect: Allow
+            Action:
+              - secretsmanager:PutSecretValue
+              - secretsmanager:DescribeSecret
+            Resource:
+              - !Ref DbConnectionSecret
+              - !Ref IamKeyProtectionSecret
+              - !Ref DockerHubSecret
+          - Sid: BitacorasLectura
+            Effect: Allow
+            Action:
+              - logs:GetLogEvents
+              - logs:FilterLogEvents
+              - logs:DescribeLogStreams
+            Resource: !GetAtt LogGroup.Arn
+          - Sid: RdsYAlbLectura
+            Effect: Allow
+            Action:
+              - rds:Describe*
+              - elasticloadbalancing:Describe*
+            Resource: "*"
+      # La politica queda creada pero sin adjuntar. Asociala al principal
+      # (cflores) con: aws iam attach-user-policy / attach-role-policy usando
+      # el ARN que aparece en la salida OperatorPolicyArn. Esto evita que la
+      # plantilla tenga que saber si OperatorPrincipalArn es usuario o rol.
+
+# ---------------------------------------------------------------------------
+# 12. SALIDAS: lo que el solicitante necesita recibir.
+# ---------------------------------------------------------------------------
+Outputs:
+  Region:
+    Description: Region del despliegue
+    Value: !Ref "AWS::Region"
+  ClusterName:
+    Description: Nombre del cluster ECS
+    Value: !Ref EcsCluster
+  ServiceConnectNamespaceArn:
+    Description: ARN del namespace de Service Connect
+    Value: !GetAtt ServiceConnectNamespace.Arn
+  AppSubnet1Id:
+    Description: Subred privada de aplicacion AZ1
+    Value: !Ref AppSubnet1
+  AppSubnet2Id:
+    Description: Subred privada de aplicacion AZ2
+    Value: !Ref AppSubnet2
+  EcsSecurityGroupId:
+    Description: Grupo de seguridad ECS
+    Value: !Ref EcsSecurityGroup
+  TaskExecutionRoleArn:
+    Description: ARN del rol de ejecucion de tareas
+    Value: !GetAtt TaskExecutionRole.Arn
+  TaskRoleArn:
+    Description: ARN del rol de tarea
+    Value: !GetAtt TaskRole.Arn
+  NginxTargetGroupArn:
+    Description: ARN del grupo de destino para nginx
+    Value: !Ref NginxTargetGroup
+  LoadBalancerDns:
+    Description: Nombre DNS del balanceador
+    Value: !GetAtt LoadBalancer.DNSName
+  DbEndpoint:
+    Description: Endpoint de RDS
+    Value: !GetAtt Database.Endpoint.Address
+  DbPort:
+    Description: Puerto de RDS
+    Value: !GetAtt Database.Endpoint.Port
+  FileSystemId:
+    Description: Id del sistema de archivos EFS
+    Value: !Ref FileSystem
+  AccessPointId:
+    Description: Id del punto de acceso EFS (/FinzaiDocs)
+    Value: !Ref FinzaiDocsAccessPoint
+  DbConnectionSecretArn:
+    Value: !Ref DbConnectionSecret
+  IamKeyProtectionSecretArn:
+    Value: !Ref IamKeyProtectionSecret
+  DockerHubSecretArn:
+    Value: !Ref DockerHubSecret
+  DbMasterSecretArn:
+    Description: Secreto con las credenciales maestras generadas para RDS
+    Value: !Ref DbMasterSecret
+  EcrRepositoryUri:
+    Description: URI del repositorio ECR para la imagen de nginx
+    Value: !GetAtt EcrRepository.RepositoryUri
+  LogGroupArn:
+    Value: !GetAtt LogGroup.Arn
+  OperatorPolicyArn:
+    Condition: HasOperator
+    Description: ARN de la politica de operador (asociala al usuario/rol)
+    Value: !Ref OperatorPolicy
